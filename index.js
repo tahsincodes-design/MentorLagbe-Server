@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import { connectDB, db } from "./db.js";
 
 dotenv.config();
 
@@ -10,9 +11,56 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
+// MongoDB Collections (shared with Better Auth)
+const usersCollection = db.collection("user");
+const jobsCollection = db.collection("jobs");
+
+// Reusable Role-Check Middleware ("student" | "mentor" | "admin")
+const requireRole = (...allowedRoles) => {
+    return async (req, res, next) => {
+        try {
+            const email = req.body?.postedByEmail || req.headers["x-user-email"];
+
+            if (!email) {
+                return res.status(401).json({
+                    success: false,
+                    message: "User email is required to verify permissions.",
+                });
+            }
+
+            const user = await usersCollection.findOne({ email });
+
+            if (!user) {
+                return res.status(404).json({
+                    success: false,
+                    message: "User account not found.",
+                });
+            }
+
+            const userRole = user.type || "student";
+
+            if (!allowedRoles.includes(userRole)) {
+                return res.status(403).json({
+                    success: false,
+                    message: `Access denied. Only ${allowedRoles.join(" or ")} accounts can perform this action.`,
+                });
+            }
+
+            req.currentUser = user;
+            next();
+        } catch (error) {
+            res.status(500).json({
+                success: false,
+                message: "Failed to verify user role.",
+                error: error.message,
+            });
+        }
+    };
+};
+
 // Styled API Home Page
 app.get("/", (req, res) => {
-  res.status(200).send(`
+    res.status(200).send(`
     <!DOCTYPE html>
     <html lang="en">
       <head>
@@ -94,34 +142,129 @@ app.get("/", (req, res) => {
   `);
 });
 
-// JSON Health Endpoint
-app.get("/api/health", (req, res) => {
-  res.status(200).json({
-    success: true,
-    service: "MentorLagbe API",
-    uptime: `${Math.floor(process.uptime())}s`,
-    timestamp: new Date().toISOString(),
-  });
+// Create a Job (Only "student" and "admin" allowed)
+app.post("/jobs", requireRole("student", "admin"), async (req, res) => {
+    try {
+        const { title, description, subject, budget, location } = req.body;
+
+        if (!title || !description) {
+            return res.status(400).json({
+                success: false,
+                message: "Job title and description are required.",
+            });
+        }
+
+        const newJob = {
+            title: title.trim(),
+            description: description.trim(),
+            subject: subject || "",
+            budget: budget || null,
+            location: location || "Online",
+            postedBy: {
+                name: req.currentUser.name,
+                email: req.currentUser.email,
+                role: req.currentUser.type || "student",
+            },
+            status: "open",
+            createdAt: new Date(),
+        };
+
+        const result = await jobsCollection.insertOne(newJob);
+
+        res.status(201).json({
+            success: true,
+            message: "Job created successfully.",
+            insertedId: result.insertedId,
+            data: newJob,
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            message: "Failed to create job.",
+            error: error.message,
+        });
+    }
 });
 
-app.listen(PORT, () => {
-  const c = {
-    reset: "\x1b[0m",
-    bold: "\x1b[1m",
-    cyan: "\x1b[36m",
-    green: "\x1b[32m",
-    gray: "\x1b[90m",
-  };
+// Get All Jobs (Newest First)
+app.get("/jobs", async (req, res) => {
+    try {
+        const jobs = await jobsCollection
+            .find({})
+            .sort({ createdAt: -1 })
+            .toArray();
 
-    console.log(`
+        res.status(200).json({
+            success: true,
+            data: jobs,
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            message: "Failed to fetch jobs.",
+            error: error.message,
+        });
+    }
+});
+
+// Combined Server Health & MongoDB Connection Check
+app.get("/api/health", async (req, res) => {
+    try {
+        await db.command({ ping: 1 });
+
+        res.status(200).json({
+            success: true,
+            service: "MentorLagbe API",
+            database: {
+                name: "mentor-lagbe",
+                status: "connected",
+            },
+            uptime: `${Math.floor(process.uptime())}s`,
+            timestamp: new Date().toISOString(),
+        });
+    } catch (error) {
+        res.status(503).json({
+            success: false,
+            service: "MentorLagbe API",
+            database: {
+                name: "mentor-lagbe",
+                status: "disconnected",
+                error: error.message,
+            },
+            uptime: `${Math.floor(process.uptime())}s`,
+            timestamp: new Date().toISOString(),
+        });
+    }
+});
+
+// Connect to MongoDB first, then start server with banner
+connectDB()
+    .then(() => {
+        app.listen(PORT, () => {
+            const c = {
+                reset: "\x1b[0m",
+                bold: "\x1b[1m",
+                cyan: "\x1b[36m",
+                green: "\x1b[32m",
+                gray: "\x1b[90m",
+            };
+
+            console.log(`
 ${c.cyan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${c.reset}
   ${c.bold}MentorLagbe API Server${c.reset}  ${c.green}● ONLINE${c.reset}
 ${c.cyan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${c.reset}
   ${c.gray}Home Page :${c.reset}  ${c.bold}http://localhost:${PORT}${c.reset}
   ${c.gray}Health API:${c.reset}  http://localhost:${PORT}/api/health
+  ${c.gray}MongoDB Connection :${c.reset}  ${c.bold}Connected${c.reset}
+  ${c.gray}Database  :${c.reset}  mentor-lagbe ${c.green}(connected)${c.reset}
   ${c.gray}Mode      :${c.reset}  ${process.env.NODE_ENV || "development"}
 ${c.cyan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${c.reset}
-  `);
-});
+      `);
+        });
+    })
+    .catch((err) => {
+        console.error("Failed to connect to MongoDB", err);
+        process.exit(1);
+    });
 
 export default app;
