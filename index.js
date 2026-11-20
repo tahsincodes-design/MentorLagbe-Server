@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import { connectDB, db } from "./db.js";
+import { createJobsRouter } from "./jobs.js";
 
 dotenv.config();
 
@@ -10,53 +11,6 @@ const PORT = process.env.PORT || 5000;
 
 app.use(cors());
 app.use(express.json());
-
-// MongoDB Collections (shared with Better Auth)
-const usersCollection = db.collection("user");
-const jobsCollection = db.collection("jobs");
-
-// Reusable Role-Check Middleware ("student" | "mentor" | "admin")
-const requireRole = (...allowedRoles) => {
-    return async (req, res, next) => {
-        try {
-            const email = req.body?.postedByEmail || req.headers["x-user-email"];
-
-            if (!email) {
-                return res.status(401).json({
-                    success: false,
-                    message: "User email is required to verify permissions.",
-                });
-            }
-
-            const user = await usersCollection.findOne({ email });
-
-            if (!user) {
-                return res.status(404).json({
-                    success: false,
-                    message: "User account not found.",
-                });
-            }
-
-            const userRole = user.type || "student";
-
-            if (!allowedRoles.includes(userRole)) {
-                return res.status(403).json({
-                    success: false,
-                    message: `Access denied. Only ${allowedRoles.join(" or ")} accounts can perform this action.`,
-                });
-            }
-
-            req.currentUser = user;
-            next();
-        } catch (error) {
-            res.status(500).json({
-                success: false,
-                message: "Failed to verify user role.",
-                error: error.message,
-            });
-        }
-    };
-};
 
 // Styled API Home Page
 app.get("/", (req, res) => {
@@ -142,70 +96,7 @@ app.get("/", (req, res) => {
   `);
 });
 
-// Create a Job (Only "student" and "admin" allowed)
-app.post("/jobs", requireRole("student", "admin"), async (req, res) => {
-    try {
-        const { title, description, subject, budget, location } = req.body;
-
-        if (!title || !description) {
-            return res.status(400).json({
-                success: false,
-                message: "Job title and description are required.",
-            });
-        }
-
-        const newJob = {
-            title: title.trim(),
-            description: description.trim(),
-            subject: subject || "",
-            budget: budget || null,
-            location: location || "Online",
-            postedBy: {
-                name: req.currentUser.name,
-                email: req.currentUser.email,
-                role: req.currentUser.type || "student",
-            },
-            status: "open",
-            createdAt: new Date(),
-        };
-
-        const result = await jobsCollection.insertOne(newJob);
-
-        res.status(201).json({
-            success: true,
-            message: "Job created successfully.",
-            insertedId: result.insertedId,
-            data: newJob,
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            message: "Failed to create job.",
-            error: error.message,
-        });
-    }
-});
-
-// Get All Jobs (Newest First)
-app.get("/jobs", async (req, res) => {
-    try {
-        const jobs = await jobsCollection
-            .find({})
-            .sort({ createdAt: -1 })
-            .toArray();
-
-        res.status(200).json({
-            success: true,
-            data: jobs,
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            message: "Failed to fetch jobs.",
-            error: error.message,
-        });
-    }
-});
+app.use("/jobs", createJobsRouter(db));
 
 // Combined Server Health & MongoDB Connection Check
 app.get("/api/health", async (req, res) => {
