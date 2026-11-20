@@ -2,7 +2,7 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import { connectDB, db } from "./db.js";
-import { createJobsRouter } from "./jobs.js";
+import { createJobsRouter, ensureTuitionIndexes } from "./jobs.js";
 
 dotenv.config();
 
@@ -130,7 +130,8 @@ app.get("/api/health", async (req, res) => {
 
 // Connect to MongoDB first, then start server with banner
 connectDB()
-    .then(() => {
+    .then(async () => {
+        await ensureTuitionIndexes(db);
         app.listen(PORT, () => {
             const c = {
                 reset: "\x1b[0m",

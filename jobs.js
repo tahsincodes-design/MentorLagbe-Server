@@ -2,43 +2,74 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { Router } from "express";
 import { ObjectId } from "mongodb";
 
-const JOB_FIELDS = ["title", "description", "subject", "salary", "location", "status"];
+const JOB_FIELDS = ["title", "description", "subject", "salary", "location"];
 const REVIEW_STATUSES = ["accepted", "rejected"];
 
 function fail(res, status, message) {
     return res.status(status).json({ success: false, message });
 }
 
+const PUBLISHED = { approvalStatus: "approved", isActive: true };
+
 function roleOf(user) {
     return user ? String(user.role ?? "student").toLowerCase() : null;
 }
 
-function canManage(job, user) {
+function isTutor(user) {
     const role = roleOf(user);
-    if (role === "admin") return true;
-    if (role !== "student") return false;
-    if (job.postedBy?.userId) return String(job.postedBy.userId) === String(user._id);
-    return Boolean(job.postedBy?.email && job.postedBy.email.toLowerCase() === user.email.toLowerCase());
+    return role === "mentor" || role === "tutor";
 }
 
-function publicJob(job, user) {
+function ownsTuition(tuition, user) {
+    if (!isTutor(user)) return false;
+    if (tuition.tutorId) return String(tuition.tutorId) === String(user._id);
+    return Boolean(tuition.tutorEmail && tuition.tutorEmail.toLowerCase() === user.email.toLowerCase());
+}
+
+function isPublished(tuition) {
+    return tuition.approvalStatus === PUBLISHED.approvalStatus && tuition.isActive === PUBLISHED.isActive;
+}
+
+function objectId(value) {
+    return /^[a-f0-9]{24}$/i.test(value) ? new ObjectId(value) : null;
+}
+
+function publicTuition(tuition, user) {
     return {
-        _id: String(job._id),
-        title: job.title,
-        description: job.description,
-        subject: job.subject,
-        salary: job.salary ?? job.budget ?? null,
-        location: job.location,
-        status: job.status ?? "open",
-        createdAt: job.createdAt,
-        postedBy: { name: job.postedBy?.name },
-        canManage: canManage(job, user),
+        _id: String(tuition._id),
+        title: tuition.title,
+        description: tuition.description,
+        subject: tuition.subject,
+        salary: tuition.salary ?? tuition.budget ?? null,
+        location: tuition.location,
+        approvalStatus: tuition.approvalStatus ?? "pending",
+        isActive: tuition.isActive === true,
+        revision: tuition.revision ?? 0,
+        createdAt: tuition.createdAt,
+        postedBy: { name: tuition.tutorName ?? tuition.postedBy?.name },
+        canManage: ownsTuition(tuition, user),
+        canModerate: roleOf(user) === "admin",
     };
 }
 
+export function ensureTuitionIndexes(db) {
+    return db.collection("applications").createIndex(
+        { tuitionId: 1, studentEmail: 1 },
+        {
+            name: "unique_tuition_student_application",
+            unique: true,
+            partialFilterExpression: {
+                tuitionId: { $type: "objectId" },
+                studentEmail: { $type: "string" },
+            },
+        },
+    );
+}
+
+
 function readJobFields(body, create = false) {
     if (!body || typeof body !== "object" || Array.isArray(body)) return null;
-    const fields = create ? { status: "open" } : {};
+    const fields = {};
     for (const field of JOB_FIELDS) {
         if (!Object.hasOwn(body, field)) continue;
         const value = body[field];
@@ -58,13 +89,12 @@ function readJobFields(body, create = false) {
 
         if (typeof value !== "string") return null;
         const trimmed = value.trim();
-        if (field === "status" && !["open", "closed"].includes(trimmed)) return null;
         if (["title", "description"].includes(field) && !trimmed) return null;
         if (trimmed.length > (field === "description" ? 1500 : 160)) return null;
         fields[field] = trimmed;
     }
     if (create && (!fields.title || !fields.description)) return null;
-    return Object.keys(fields).length ? fields : null;
+    return fields;
 }
 
 function digest(value) {
@@ -73,7 +103,7 @@ function digest(value) {
 
 export function createJobsRouter(db) {
     const router = Router();
-    const jobs = db.collection("jobs");
+    const tuitions = db.collection("tuitions");
     const users = db.collection("user");
     const applications = db.collection("applications");
 
@@ -94,64 +124,77 @@ export function createJobsRouter(db) {
         next();
     });
 
-    router.param("jobId", async (req, res, next, jobId) => {
-        if (!/^[a-z0-9_-]{1,128}$/i.test(jobId)) return fail(res, 404, "Job not found.");
-        if (/^[a-f0-9]{24}$/i.test(jobId)) {
-            req.job = await jobs.findOne({ _id: new ObjectId(jobId) });
-        }
-        req.job ??= await jobs.findOne({ _id: jobId });
-        if (!req.job) return fail(res, 404, "Job not found.");
+    router.param("jobId", async (req, res, next, value) => {
+        const _id = objectId(value);
+        if (!_id) return fail(res, 404, "Tuition not found.");
+        req.tuition = await tuitions.findOne({ _id });
+        if (!req.tuition) return fail(res, 404, "Tuition not found.");
         next();
     });
 
-    function requireManager(req, res, next) {
-        if (!req.currentUser) return fail(res, 401, "Please sign in to manage this job.");
-        if (!canManage(req.job, req.currentUser)) return fail(res, 403, "You cannot manage this job.");
-        next();
-    }
-
-    function requireMentor(req, res, next) {
-        if (!req.currentUser) return fail(res, 401, "Please sign in to apply.");
-        if (roleOf(req.currentUser) !== "mentor") return fail(res, 403, "Only mentors can apply.");
+    function requireOwner(req, res, next) {
+        if (!req.currentUser) return fail(res, 401, "Please sign in to manage this tuition.");
+        if (!ownsTuition(req.tuition, req.currentUser)) return fail(res, 403, "Only the tutor who posted this tuition can manage it.");
         next();
     }
 
     router.get("/", async (req, res) => {
-        const records = await jobs.find({}).sort({ createdAt: -1 }).toArray();
-        res.json({ success: true, data: records.map((job) => publicJob(job, req.currentUser)) });
+        const user = req.currentUser;
+        let query = PUBLISHED;
+        if (req.query.view === "manage") {
+            if (roleOf(user) === "admin") {
+                query = {};
+            } else if (isTutor(user)) {
+                query = {
+                    $or: [
+                        { tutorId: user._id },
+                        { tutorId: String(user._id) },
+                        { tutorId: null, tutorEmail: user.email },
+                    ],
+                };
+            } else {
+                return fail(res, user ? 403 : 401, "Sign in as a tutor or admin to view this dashboard.");
+            }
+        }
+        const records = await tuitions.find(query).sort({ createdAt: -1 }).toArray();
+        res.json({ success: true, data: records.map((tuition) => publicTuition(tuition, user)) });
     });
 
     router.post("/", async (req, res) => {
-        if (!req.currentUser) return fail(res, 401, "Please sign in to post a job.");
-        const role = roleOf(req.currentUser);
-        if (role !== "student" && role !== "admin") {
-            return fail(res, 403, "Only students and admins can post jobs.");
-        }
+        const user = req.currentUser;
+        if (!user) return fail(res, 401, "Please sign in to post a tuition.");
+        if (!isTutor(user)) return fail(res, 403, "Only tutors can post tuitions.");
 
         const fields = readJobFields(req.body, true);
-        if (!fields) return fail(res, 400, "Enter a title, description, and valid job details.");
-        const job = {
+        if (!fields) return fail(res, 400, "Enter a title, description, and valid tuition details.");
+        const tuition = {
             ...fields,
-            postedBy: {
-                userId: String(req.currentUser._id),
-                name: req.currentUser.name,
-                email: req.currentUser.email,
-                role,
-            },
+            tutorId: user._id,
+            tutorName: user.name,
+            tutorEmail: user.email,
+            approvalStatus: "pending",
+            isActive: true,
+            revision: 0,
             createdAt: new Date(),
         };
-        const { insertedId } = await jobs.insertOne(job);
-        res.status(201).json({ success: true, data: publicJob({ ...job, _id: insertedId }, req.currentUser) });
+        const { insertedId } = await tuitions.insertOne(tuition);
+        res.status(201).json({ success: true, data: publicTuition({ ...tuition, _id: insertedId }, user) });
     });
 
     router.get("/:jobId", async (req, res) => {
-        const data = publicJob(req.job, req.currentUser);
-        const jobId = data._id;
-        const application = roleOf(req.currentUser) === "mentor"
-            ? await applications.findOne({ jobId, userId: String(req.currentUser._id) })
+        const user = req.currentUser;
+        const tuition = req.tuition;
+        const data = publicTuition(tuition, user);
+        if (!isPublished(tuition) && !data.canManage && !data.canModerate) {
+            return fail(res, 404, "Tuition not found.");
+        }
+
+        const tuitionId = tuition._id;
+        const application = roleOf(user) === "student"
+            ? await applications.findOne({ tuitionId, studentEmail: user.email })
             : null;
         const applicants = data.canManage
-            ? await applications.find({ jobId }).sort({ createdAt: -1 }).toArray()
+            ? await applications.find({ tuitionId }).sort({ createdAt: -1 }).toArray()
             : [];
 
         res.json({
@@ -162,78 +205,120 @@ export function createJobsRouter(db) {
         });
     });
 
-    async function updateJob(req, res) {
-        const fields = readJobFields(req.path.endsWith("/status") ? { status: req.body?.status } : req.body);
-        if (!fields) return fail(res, 400, "Enter valid job details or status.");
-        if ("salary" in fields) {
-            // Older listings use budget. Clear it when a fee is explicitly changed.
-            fields.budget = null;
+    async function updateTuition(req, res) {
+        const fields = readJobFields(req.body);
+        if (!fields) return fail(res, 400, "Enter valid tuition details.");
+        const editsContent = Object.keys(fields).length > 0;
+        const { isActive } = req.body;
+        if ((!editsContent && typeof isActive !== "boolean") || (isActive !== undefined && typeof isActive !== "boolean")) {
+            return fail(res, 400, "Enter valid tuition details or an active status.");
         }
-        const job = await jobs.findOneAndUpdate(
-            { _id: req.job._id },
-            { $set: { ...fields, updatedAt: new Date() } },
+        const update = { ...fields, updatedAt: new Date() };
+        if (typeof isActive === "boolean") update.isActive = isActive;
+        if (editsContent) update.approvalStatus = "pending";
+        if ("salary" in fields) update.budget = null;
+
+        const tuition = await tuitions.findOneAndUpdate(
+            { _id: req.tuition._id },
+            {
+                $set: update,
+                ...(editsContent ? { $inc: { revision: 1 } } : {}),
+            },
             { returnDocument: "after" },
         );
-        if (!job) return fail(res, 404, "Job not found.");
-        res.json({ success: true, data: publicJob(job, req.currentUser) });
+        if (!tuition) return fail(res, 404, "Tuition not found.");
+        res.json({ success: true, data: publicTuition(tuition, req.currentUser) });
     }
 
-    router.put("/:jobId", requireManager, updateJob);
-    router.patch("/:jobId", requireManager, updateJob);
-    router.patch("/:jobId/status", requireManager, updateJob);
+    router.put("/:jobId", requireOwner, updateTuition);
+    router.patch("/:jobId", requireOwner, updateTuition);
 
-    router.delete("/:jobId", requireManager, async (req, res) => {
-        const result = await jobs.deleteOne({ _id: req.job._id });
-        if (!result.deletedCount) return fail(res, 404, "Job not found.");
+    router.patch("/:jobId/approval", async (req, res) => {
+        if (!req.currentUser) return fail(res, 401, "Please sign in to review this tuition.");
+        if (roleOf(req.currentUser) !== "admin") return fail(res, 403, "Only admins can review tuitions.");
+        const { approvalStatus, revision } = req.body ?? {};
+        if (!["approved", "rejected"].includes(approvalStatus) || !Number.isSafeInteger(revision) || revision < 0) {
+            return fail(res, 400, "Choose a decision for the current tuition revision.");
+        }
+
+        const revisionFilter = revision === 0
+            ? { $or: [{ revision: 0 }, { revision: { $exists: false } }] }
+            : { revision };
+        const tuition = await tuitions.findOneAndUpdate(
+            { _id: req.tuition._id, ...revisionFilter },
+            { $set: { approvalStatus, reviewedAt: new Date() } },
+            { returnDocument: "after" },
+        );
+        if (!tuition) return fail(res, 409, "This tuition changed. Refresh and review the latest version.");
+        res.json({ success: true, data: publicTuition(tuition, req.currentUser) });
+    });
+
+    router.delete("/:jobId", requireOwner, async (req, res) => {
+        const result = await tuitions.deleteOne({ _id: req.tuition._id });
+        if (!result.deletedCount) return fail(res, 404, "Tuition not found.");
         res.json({ success: true });
     });
 
-    router.post("/:jobId/applications", requireMentor, async (req, res) => {
-        if (req.job.status === "closed") return fail(res, 409, "This job is closed to applications.");
+    router.post("/:jobId/applications", async (req, res) => {
+        const user = req.currentUser;
+        if (!user) return fail(res, 401, "Please sign in to apply.");
+        if (roleOf(user) !== "student") return fail(res, 403, "Only students can apply.");
+        if (!isPublished(req.tuition)) return fail(res, 409, "This tuition is not open for applications.");
 
         const message = typeof req.body?.message === "string" ? req.body.message.trim() : "";
         if (!message || message.length > 1000) {
             return fail(res, 400, "Enter an application message between 1 and 1,000 characters.");
         }
 
-        const jobId = String(req.job._id);
-        const userId = String(req.currentUser._id);
-        const existing = await applications.findOne({ jobId, userId });
-        if (existing) return res.json({ success: true, data: { status: existing.status } });
-
-        // The deterministic MongoDB key allows only one application under concurrent submissions.
-        const key = createHash("sha256").update(JSON.stringify([jobId, userId])).digest("hex");
-        const query = { _id: key };
-        let application;
-        try {
-            application = await applications.findOneAndUpdate(
-                query,
-                { $setOnInsert: { jobId, userId, name: req.currentUser.name, message, status: "pending", createdAt: new Date() } },
-                { upsert: true, returnDocument: "after" },
-            );
-        } catch (error) {
-            if (error.code !== 11000) throw error;
-            application = await applications.findOne(query);
-            if (!application) throw error;
+        const tutorEmail = req.tuition.tutorEmail;
+        if (typeof tutorEmail !== "string" || !tutorEmail.trim()) {
+            return fail(res, 409, "This tuition is missing its tutor account details.");
         }
-        res.json({ success: true, data: { status: application.status } });
+        const tuitionId = req.tuition._id;
+        const studentEmail = user.email;
+        const result = await db.client.withSession((session) => session.withTransaction(async () => {
+            const existing = await applications.findOne({ tuitionId, studentEmail }, { session });
+            if (existing) return { status: existing.status, created: false };
+
+            const tuition = await tuitions.findOneAndUpdate(
+                { _id: tuitionId, ...PUBLISHED },
+                { $inc: { applicationCount: 1 } },
+                { session, returnDocument: "after" },
+            );
+            if (!tuition) return null;
+
+            const application = {
+                tuitionId,
+                tutorEmail,
+                studentEmail,
+                name: user.name,
+                message,
+                status: "pending",
+                createdAt: new Date(),
+            };
+            await applications.insertOne(application, { session });
+            return { status: application.status, created: true };
+        }));
+
+        if (!result) return fail(res, 409, "This tuition is not open for applications.");
+        res.status(result.created ? 201 : 200).json({ success: true, data: { status: result.status } });
     });
 
-    router.patch("/:jobId/applications/:applicationId", requireManager, async (req, res) => {
-        const { applicationId } = req.params;
+    router.patch("/:jobId/applications/:applicationId", requireOwner, async (req, res) => {
+        const _id = objectId(req.params.applicationId);
+        if (!_id) return fail(res, 404, "Application not found.");
         const status = req.body?.status;
         if (!REVIEW_STATUSES.includes(status)) return fail(res, 400, "Choose accepted or rejected.");
-        if (!/^(?:[a-f0-9]{24}|[a-f0-9]{64})$/i.test(applicationId)) return fail(res, 404, "Application not found.");
 
-        const id = applicationId.length === 24 ? new ObjectId(applicationId) : applicationId;
         const application = await applications.findOneAndUpdate(
-            { _id: id, jobId: String(req.job._id) },
+            { _id, tuitionId: req.tuition._id },
             { $set: { status, updatedAt: new Date() } },
             { returnDocument: "after" },
         );
         if (!application) return fail(res, 404, "Application not found.");
         res.json({ success: true, data: { status: application.status } });
     });
+
 
     router.use((error, req, res, next) => {
         if (res.headersSent) return next(error);
