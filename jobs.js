@@ -34,6 +34,10 @@ function objectId(value) {
     return /^[a-f0-9]{24}$/i.test(value) ? new ObjectId(value) : null;
 }
 
+function summarizeTuition(tuition) {
+    return { title: tuition.title, tutorName: tuition.tutorName ?? tuition.postedBy?.name ?? null };
+}
+
 function publicTuition(tuition, user) {
     return {
         _id: String(tuition._id),
@@ -181,6 +185,43 @@ export function createJobsRouter(db) {
         res.status(201).json({ success: true, data: publicTuition({ ...tuition, _id: insertedId }, user) });
     });
 
+    router.get("/applications", async (req, res) => {
+        const user = req.currentUser;
+        if (!user) return fail(res, 401, "Please sign in to view your applications.");
+        if (roleOf(user) !== "student") return fail(res, 403, "Only students can view this page.");
+
+        const records = await applications
+            .find({ studentEmail: user.email, tuitionId: { $type: "objectId" } }, {
+                projection: { tuitionId: 1, tuitionSnapshot: 1, status: 1, createdAt: 1 },
+            })
+            .sort({ createdAt: -1, _id: -1 })
+            .toArray();
+        const tuitionIds = [...new Map(records.map(({ tuitionId }) => [String(tuitionId), tuitionId])).values()];
+        const listings = tuitionIds.length
+            ? await tuitions.find({ _id: { $in: tuitionIds } }, {
+                projection: { title: 1, tutorName: 1, "postedBy.name": 1, approvalStatus: 1, isActive: 1 },
+            }).toArray()
+            : [];
+        const listingsById = new Map(listings.map((tuition) => [String(tuition._id), tuition]));
+
+        res.json({
+            success: true,
+            data: records.map(({ _id, tuitionId, tuitionSnapshot, status, createdAt }) => {
+                const tuition = listingsById.get(String(tuitionId));
+                const summary = tuitionSnapshot ?? (tuition?.approvalStatus === "approved" ? summarizeTuition(tuition) : null);
+                return {
+                    _id: String(_id),
+                    tuitionId: String(tuitionId),
+                    title: summary?.title ?? null,
+                    tutorName: summary?.tutorName ?? null,
+                    status,
+                    createdAt,
+                    available: Boolean(tuition && isPublished(tuition)),
+                };
+            }),
+        });
+    });
+
     router.get("/:jobId", async (req, res) => {
         const user = req.currentUser;
         const tuition = req.tuition;
@@ -254,8 +295,19 @@ export function createJobsRouter(db) {
     });
 
     router.delete("/:jobId", requireOwner, async (req, res) => {
-        const result = await tuitions.deleteOne({ _id: req.tuition._id });
-        if (!result.deletedCount) return fail(res, 404, "Tuition not found.");
+        const deleted = await db.client.withSession((session) => session.withTransaction(async () => {
+            const tuition = await tuitions.findOneAndDelete({ _id: req.tuition._id }, { session });
+            if (!tuition) return false;
+            if (tuition.approvalStatus === "approved") {
+                await applications.updateMany(
+                    { tuitionId: tuition._id, tuitionSnapshot: { $exists: false } },
+                    { $set: { tuitionSnapshot: summarizeTuition(tuition) } },
+                    { session },
+                );
+            }
+            return true;
+        }));
+        if (!deleted) return fail(res, 404, "Tuition not found.");
         res.json({ success: true });
     });
 
@@ -290,6 +342,7 @@ export function createJobsRouter(db) {
             const application = {
                 tuitionId,
                 tutorEmail,
+                tuitionSnapshot: summarizeTuition(tuition),
                 studentEmail,
                 name: user.name,
                 message,
