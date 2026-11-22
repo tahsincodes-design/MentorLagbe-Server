@@ -4,6 +4,7 @@ import { ObjectId } from "mongodb";
 
 const JOB_FIELDS = ["title", "description", "subject", "salary", "location"];
 const REVIEW_STATUSES = ["accepted", "rejected"];
+const FREE_TUITION_LIMIT = 2;
 
 function fail(res, status, message) {
     return res.status(status).json({ success: false, message });
@@ -18,6 +19,26 @@ function roleOf(user) {
 function isTutor(user) {
     const role = roleOf(user);
     return role === "mentor" || role === "tutor";
+}
+
+function tutorTuitions(user) {
+    return {
+        $or: [
+            { tutorId: user._id },
+            { tutorId: String(user._id) },
+            { tutorId: null, tutorEmail: user.email },
+        ],
+    };
+}
+
+function hasPremium(doc) {
+    const mode = process.env.STRIPE_MEMBERSHIP_MODE === "test" ? "test" : "live";
+    const account = process.env.STRIPE_TEST_SANDBOX_ID?.trim();
+    if (mode === "test" && account && !/^acct_[a-zA-Z0-9]+$/.test(account)) {
+        throw new Error("Invalid Stripe test sandbox account ID");
+    }
+    const plan = mode === "test" && account ? doc?.testSandboxes?.[account] : doc?.[mode];
+    return plan?.plan === "premium" && plan.accessUntil instanceof Date && plan.accessUntil.getTime() > Date.now();
 }
 
 function ownsTuition(tuition, user) {
@@ -110,6 +131,7 @@ export function createJobsRouter(db) {
     const tuitions = db.collection("tuitions");
     const users = db.collection("user");
     const applications = db.collection("applications");
+    const memberships = db.collection("memberships");
 
     router.use(async (req, res, next) => {
         const expected = process.env.JOBS_API_SECRET?.trim();
@@ -149,19 +171,26 @@ export function createJobsRouter(db) {
             if (roleOf(user) === "admin") {
                 query = {};
             } else if (isTutor(user)) {
-                query = {
-                    $or: [
-                        { tutorId: user._id },
-                        { tutorId: String(user._id) },
-                        { tutorId: null, tutorEmail: user.email },
-                    ],
-                };
+                query = tutorTuitions(user);
             } else {
                 return fail(res, user ? 403 : 401, "Sign in as a tutor or admin to view this dashboard.");
             }
         }
         const records = await tuitions.find(query).sort({ createdAt: -1 }).toArray();
-        res.json({ success: true, data: records.map((tuition) => publicTuition(tuition, user)) });
+        let membership;
+        if (req.query.view === "manage" && isTutor(user)) {
+            const premium = hasPremium(await memberships.findOne({ _id: String(user._id) }));
+            membership = {
+                plan: premium ? "premium" : "free",
+                tuitionCount: records.length,
+                tuitionLimit: premium ? null : FREE_TUITION_LIMIT,
+                ...(premium ? { insights: {
+                    published: records.filter(isPublished).length,
+                    applications: records.reduce((total, tuition) => total + (tuition.applicationCount ?? 0), 0),
+                } } : {}),
+            };
+        }
+        res.json({ success: true, data: records.map((tuition) => publicTuition(tuition, user)), membership });
     });
 
     router.post("/", async (req, res) => {
@@ -181,7 +210,33 @@ export function createJobsRouter(db) {
             revision: 0,
             createdAt: new Date(),
         };
-        const { insertedId } = await tuitions.insertOne(tuition);
+        const memberId = String(user._id);
+        try {
+            await memberships.updateOne(
+                { _id: memberId },
+                { $setOnInsert: { live: { plan: "free" }, test: { plan: "free" } } },
+                { upsert: true },
+            );
+        } catch (error) {
+            if (error.code !== 11000) throw error;
+        }
+        const insertedId = await db.client.withSession((session) => session.withTransaction(async () => {
+            // Taking a write lock on the membership serializes simultaneous posts and billing changes.
+            const membership = await memberships.findOneAndUpdate(
+                { _id: memberId },
+                { $inc: { tuitionQuotaRevision: 1 } },
+                { session, returnDocument: "after" },
+            );
+            if (!hasPremium(membership)) {
+                const count = await tuitions.countDocuments(tutorTuitions(user), { session, limit: FREE_TUITION_LIMIT });
+                if (count >= FREE_TUITION_LIMIT) return null;
+            }
+            const result = await tuitions.insertOne({ ...tuition }, { session });
+            return result.insertedId;
+        }));
+        if (!insertedId) {
+            return fail(res, 409, "The Free plan allows two saved tuitions. Delete a tuition to free a slot or upgrade to Pro.");
+        }
         res.status(201).json({ success: true, data: publicTuition({ ...tuition, _id: insertedId }, user) });
     });
 
