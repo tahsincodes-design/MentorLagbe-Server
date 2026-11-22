@@ -1,4 +1,4 @@
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createJobsAuthMiddleware, roleOf } from "./jobs-auth.js";
 import { Router } from "express";
 import { ObjectId } from "mongodb";
 
@@ -11,10 +11,6 @@ function fail(res, status, message) {
 }
 
 const PUBLISHED = { approvalStatus: "approved", isActive: true };
-
-function roleOf(user) {
-    return user ? String(user.role ?? "student").toLowerCase() : null;
-}
 
 function isTutor(user) {
     const role = roleOf(user);
@@ -122,33 +118,13 @@ function readJobFields(body, create = false) {
     return fields;
 }
 
-function digest(value) {
-    return createHash("sha256").update(value).digest();
-}
-
 export function createJobsRouter(db) {
     const router = Router();
     const tuitions = db.collection("tuitions");
-    const users = db.collection("user");
     const applications = db.collection("applications");
     const memberships = db.collection("memberships");
 
-    router.use(async (req, res, next) => {
-        const expected = process.env.JOBS_API_SECRET?.trim();
-        const provided = req.get("x-jobs-api-secret");
-        if (!expected) return fail(res, 503, "Jobs service authentication is not configured.");
-        if (!provided || !timingSafeEqual(digest(provided), digest(expected))) {
-            return fail(res, 401, "Jobs service authentication failed.");
-        }
-
-        const userId = req.get("x-user-id");
-        if (userId) {
-            const ids = /^[a-f0-9]{24}$/i.test(userId) ? [new ObjectId(userId), userId] : [userId];
-            req.currentUser = await users.findOne({ _id: { $in: ids } });
-            if (!req.currentUser) return fail(res, 401, "User account not found.");
-        }
-        next();
-    });
+    router.use(createJobsAuthMiddleware(db.collection("user")));
 
     router.param("jobId", async (req, res, next, value) => {
         const _id = objectId(value);
