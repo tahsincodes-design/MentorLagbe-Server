@@ -1,3 +1,4 @@
+import { readDashboardAnalytics } from "./jobs-analytics.js";
 import { createJobsAuthMiddleware, roleOf } from "./jobs-auth.js";
 import { Router } from "express";
 import { ObjectId } from "mongodb";
@@ -56,6 +57,8 @@ function summarizeTuition(tuition) {
 }
 
 function publicTuition(tuition, user) {
+    const canManage = ownsTuition(tuition, user);
+    const canModerate = roleOf(user) === "admin";
     return {
         _id: String(tuition._id),
         title: tuition.title,
@@ -68,25 +71,34 @@ function publicTuition(tuition, user) {
         revision: tuition.revision ?? 0,
         createdAt: tuition.createdAt,
         postedBy: { name: tuition.tutorName ?? tuition.postedBy?.name },
-        canManage: ownsTuition(tuition, user),
-        canModerate: roleOf(user) === "admin",
+        canManage,
+        canModerate,
+        ...((canManage || canModerate) && tuition.approvalStatus === "rejected" && { rejectionReason: tuition.rejectionReason }),
     };
 }
 
 export function ensureTuitionIndexes(db) {
-    return db.collection("applications").createIndex(
-        { tuitionId: 1, studentEmail: 1 },
-        {
-            name: "unique_tuition_student_application",
-            unique: true,
-            partialFilterExpression: {
-                tuitionId: { $type: "objectId" },
-                studentEmail: { $type: "string" },
+    const applications = db.collection("applications");
+    return Promise.all([
+        applications.createIndex(
+            { tuitionId: 1, studentEmail: 1 },
+            {
+                name: "unique_tuition_student_application",
+                unique: true,
+                partialFilterExpression: {
+                    tuitionId: { $type: "objectId" },
+                    studentEmail: { $type: "string" },
+                },
             },
-        },
-    );
+        ),
+        applications.createIndex({ studentEmail: 1 }),
+        applications.createIndex({ tutorEmail: 1 }),
+        applications.createIndex({ tutorId: 1 }),
+        applications.createIndex({ tuitionId: 1, status: 1 }),
+        db.collection("savedTuitions").createIndex({ userId: 1, tuitionId: 1 }, { unique: true }),
+        db.collection("savedTuitions").createIndex({ userId: 1, createdAt: -1 }),
+    ]);
 }
-
 
 function readJobFields(body, create = false) {
     if (!body || typeof body !== "object" || Array.isArray(body)) return null;
@@ -124,9 +136,82 @@ export function createJobsRouter(db) {
     const applications = db.collection("applications");
     const memberships = db.collection("memberships");
 
+    const savedTuitions = db.collection("savedTuitions");
+
     router.use(createJobsAuthMiddleware(db.collection("user")));
 
+    async function serializeListings(records, user, pendingCounts = new Map()) {
+        const bookmarks = user && records.length
+            ? await savedTuitions.find({
+                userId: String(user._id),
+                tuitionId: { $in: records.map(({ _id }) => _id) },
+            }, { projection: { tuitionId: 1 } }).toArray()
+            : [];
+        const savedIds = new Set(bookmarks.map(({ tuitionId }) => String(tuitionId)));
+        return records.map((record) => {
+            const tuition = publicTuition(record, user);
+            if (user && isPublished(record)) tuition.isSaved = savedIds.has(tuition._id);
+            if (tuition.canManage && pendingCounts.has(tuition._id)) {
+                tuition.pendingApplications = pendingCounts.get(tuition._id);
+            }
+            return tuition;
+        });
+    }
+
+    router.get("/saved", async (req, res) => {
+        const user = req.currentUser;
+        if (!user) return fail(res, 401, "Please sign in to see saved tuitions.");
+
+        const bookmarks = await savedTuitions.find({ userId: String(user._id) })
+            .sort({ createdAt: -1, _id: -1 }).toArray();
+        const listings = bookmarks.length
+            ? await tuitions.find({ _id: { $in: bookmarks.map(({ tuitionId }) => tuitionId) }, ...PUBLISHED }).toArray()
+            : [];
+        const byId = new Map(listings.map(listing => [String(listing._id), listing]));
+        res.json({
+            success: true,
+            data: bookmarks.map(({ tuitionId, title }) => {
+                const id = String(tuitionId);
+                const listing = byId.get(id);
+                return {
+                    tuitionId: id,
+                    title: listing?.title ?? title ?? "Saved tuition",
+                    tuition: listing ? { ...publicTuition(listing, user), isSaved: true } : null,
+                };
+            }),
+        });
+    });
+
+    router.put("/saved/:tuitionId", async (req, res) => {
+        const user = req.currentUser;
+        if (!user) return fail(res, 401, "Please sign in to save a tuition.");
+        const tuitionId = objectId(req.params.tuitionId);
+        if (!tuitionId) return fail(res, 404, "Tuition not found.");
+        const tuition = await tuitions.findOne({ _id: tuitionId, ...PUBLISHED }, { projection: { title: 1 } });
+        if (!tuition) return fail(res, 404, "This tuition is unavailable.");
+        try {
+            await savedTuitions.updateOne(
+                { userId: String(user._id), tuitionId },
+                { $setOnInsert: { title: tuition.title, createdAt: new Date() } },
+                { upsert: true },
+            );
+        } catch (error) {
+            if (error.code !== 11000) throw error;
+        }
+        res.json({ success: true });
+    });
+
+    router.delete("/saved/:tuitionId", async (req, res) => {
+        const user = req.currentUser;
+        if (!user) return fail(res, 401, "Please sign in to remove a saved tuition.");
+        const tuitionId = objectId(req.params.tuitionId);
+        if (!tuitionId) return fail(res, 404, "Tuition not found.");
+        await savedTuitions.deleteOne({ userId: String(user._id), tuitionId });
+        res.json({ success: true });
+    });
+
     router.param("jobId", async (req, res, next, value) => {
+        if (!req.currentUser) return fail(res, 401, "Please sign in to view this tuition.");
         const _id = objectId(value);
         if (!_id) return fail(res, 404, "Tuition not found.");
         req.tuition = await tuitions.findOne({ _id });
@@ -142,6 +227,23 @@ export function createJobsRouter(db) {
 
     router.get("/", async (req, res) => {
         const user = req.currentUser;
+        if (req.query.view === "highest-paid") {
+            const records = await tuitions.aggregate([
+                { $match: PUBLISHED },
+                {
+                    $set: {
+                        monthlyFee: {
+                            $convert: { input: { $ifNull: ["$salary", "$budget"] }, to: "double", onError: null, onNull: null },
+                        },
+                    },
+                },
+                { $match: { monthlyFee: { $gte: 0, $lte: Number.MAX_VALUE } } },
+                { $sort: { monthlyFee: -1, createdAt: -1, _id: -1 } },
+                { $limit: 6 },
+                { $set: { salary: "$monthlyFee" } },
+            ]).toArray();
+            return res.json({ success: true, data: await serializeListings(records, user) });
+        }
         let query = PUBLISHED;
         if (req.query.view === "manage") {
             if (roleOf(user) === "admin") {
@@ -166,7 +268,15 @@ export function createJobsRouter(db) {
                 } } : {}),
             };
         }
-        res.json({ success: true, data: records.map((tuition) => publicTuition(tuition, user)), membership });
+        const pendingCounts = new Map();
+        if (req.query.view === "manage" && isTutor(user) && records.length) {
+            const counts = await applications.aggregate([
+                { $match: { tuitionId: { $in: records.map(({ _id }) => _id) }, status: "pending" } },
+                { $group: { _id: "$tuitionId", count: { $sum: 1 } } },
+            ]).toArray();
+            for (const { _id, count } of counts) pendingCounts.set(String(_id), count);
+        }
+        res.json({ success: true, data: await serializeListings(records, user, pendingCounts), membership });
     });
 
     router.post("/", async (req, res) => {
@@ -253,6 +363,18 @@ export function createJobsRouter(db) {
         });
     });
 
+    router.get("/analytics", async (req, res) => {
+        const user = req.currentUser;
+        if (!user) return fail(res, 401, "Please sign in to view dashboard analytics.");
+        const role = isTutor(user) ? "tutor" : roleOf(user);
+        if (!["student", "tutor", "admin"].includes(role)) {
+            return fail(res, 403, "Your account cannot view dashboard analytics.");
+        }
+
+        const data = await readDashboardAnalytics(db, user, role, role === "tutor" ? tutorTuitions(user) : {});
+        res.set("Cache-Control", "private, no-store").json({ success: true, data });
+    });
+
     router.get("/:jobId", async (req, res) => {
         const user = req.currentUser;
         const tuition = req.tuition;
@@ -294,7 +416,7 @@ export function createJobsRouter(db) {
             { _id: req.tuition._id },
             {
                 $set: update,
-                ...(editsContent ? { $inc: { revision: 1 } } : {}),
+                ...(editsContent ? { $inc: { revision: 1 }, $unset: { rejectionReason: "" } } : {}),
             },
             { returnDocument: "after" },
         );
@@ -313,12 +435,21 @@ export function createJobsRouter(db) {
             return fail(res, 400, "Choose a decision for the current tuition revision.");
         }
 
+        const reason = typeof req.body?.reason === "string" ? req.body.reason.trim() : "";
+        if (approvalStatus === "rejected" && (!reason || reason.length > 500)) {
+            return fail(res, 400, "Enter a rejection reason of 1 to 500 characters.");
+        }
+
         const revisionFilter = revision === 0
             ? { $or: [{ revision: 0 }, { revision: { $exists: false } }] }
             : { revision };
         const tuition = await tuitions.findOneAndUpdate(
             { _id: req.tuition._id, ...revisionFilter },
-            { $set: { approvalStatus, reviewedAt: new Date() } },
+            {
+                $set: { approvalStatus, reviewedAt: new Date(), ...(approvalStatus === "rejected" && { rejectionReason: reason }) },
+                $inc: { revision: 1 },
+                ...(approvalStatus === "approved" && { $unset: { rejectionReason: "" } }),
+            },
             { returnDocument: "after" },
         );
         if (!tuition) return fail(res, 409, "This tuition changed. Refresh and review the latest version.");
@@ -373,6 +504,7 @@ export function createJobsRouter(db) {
             const application = {
                 tuitionId,
                 tutorEmail,
+                ...(tuition.tutorId && { tutorId: tuition.tutorId }),
                 tuitionSnapshot: summarizeTuition(tuition),
                 studentEmail,
                 name: user.name,
